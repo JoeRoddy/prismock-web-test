@@ -1,0 +1,215 @@
+version: 2.1
+
+setup: &setup
+  working_directory: ~/repo
+  docker:
+    - image: cimg/node:22.8.0
+
+# Define the jobs we want to run for this project
+jobs:
+  install:
+    <<: *setup
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - node-modules-{{ checksum "yarn.lock" }}
+      - run: yarn
+      - save_cache:
+          paths:
+            - ~/.cache/yarn
+            - node_modules
+          key: node-modules-{{ checksum "yarn.lock" }}
+      - persist_to_workspace:
+          root: ~/repo
+          paths:
+            - node_modules
+            - .
+  install_without_modules_cache:
+    <<: *setup
+    steps:
+      - checkout
+      - run: yarn
+      - persist_to_workspace:
+          root: ~/repo
+          paths:
+            - node_modules
+            - .
+  lint:
+    <<: *setup
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: yarn lint
+  tsc:
+    <<: *setup
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: yarn tsc
+  test_postgres:
+    working_directory: ~/repo
+    docker:
+      - image: cimg/node:lts
+      - image: cimg/postgres:17.0
+        environment:
+          POSTGRES_PASSWORD: 'postgres'
+          POSTGRES_DB: prisma-mock
+          POSTGRES_USER: postgres
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@localhost/prisma-mock
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: npx prisma migrate dev --name init
+      - run: yarn test
+  test_mongodb:
+    working_directory: ~/repo
+    docker:
+      - image: cimg/node:lts
+      - image: bitnami/mongodb:8.0.3
+        environment:
+          MONGODB_ADVERTISED_HOSTNAME: 127.0.0.1
+          MONGODB_REPLICA_SET_MODE: primary
+          MONGODB_ROOT_USER: admin
+          MONGODB_ROOT_PASSWORD: admin
+          MONGODB_REPLICA_SET_KEY: replicasetkey123
+    environment:
+      DATABASE_URL: mongodb://admin:admin@localhost:27017/prismock?authSource=admin
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: echo "deb http://security.ubuntu.com/ubuntu focal-security main" | sudo tee /etc/apt/sources.list.d/focal-security.list
+      - run:
+          name: MongoDB Install
+          command: |
+            wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
+            echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+            sudo apt-get update
+            sudo apt-get install -y mongodb-mongosh
+      - setup_remote_docker
+      - run:
+          name: Waiting for Mongo
+          command: dockerize -wait tcp://localhost:27017 -timeout 1m
+      - checkout
+      - run:
+          name: Get versions
+          command: |
+            node -v
+            npm -v
+            mongosh --version
+            mongosh localhost --eval "db.version()"
+      - run:
+          name: Connect to DB
+          command: mongosh mongodb://admin:admin@localhost:27017 --eval "use prismock"
+      - run: rm ~/repo/prisma/schema.prisma && cp ~/repo/testing/mongodb/schema.prisma ~/repo/prisma/
+      - run: rm ~/repo/testing/index.ts && cp ~/repo/testing/index.mongodb.ts ~/repo/testing/index.ts
+      - run: npx prisma db push
+      - run: npx prisma db seed
+      - run: yarn test
+  test_mysql:
+    working_directory: ~/repo
+    docker:
+      - image: cimg/node:lts
+      - image: cimg/mysql:8.0
+        environment:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: prisma-mock
+          MYSQL_USER: mysql
+          MYSQL_PASSWORD: mysql
+    environment:
+      DATABASE_URL: mysql://root:root@localhost:3306/prisma-mock
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: rm ~/repo/prisma/schema.prisma && cp ~/repo/testing/mysql/schema.prisma ~/repo/prisma/
+      # - run: sed -i 's/postgresql/mysql/g' ~/repo/prisma/schema.prisma
+      - run:
+          name: Waiting for MySQL to be ready
+          command: |
+            for i in `seq 1 10`;
+            do
+              nc -z 127.0.0.1 3306 && echo Success && exit 0
+              echo -n .
+              sleep 1
+            done
+            echo Failed waiting for MySQL && exit 1
+      - run: npx prisma migrate dev --name init
+      - run: yarn test
+  release:
+    <<: *setup
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run: yarn build
+      - run: yarn semantic-release
+workflows:
+  master_deploy:
+    jobs:
+      - install:
+          filters:
+            branches:
+              only:
+                - master
+      - release:
+          requires:
+            - install
+  develop_test:
+    jobs:
+      - install:
+          filters:
+            branches:
+              ignore:
+                - develop
+                - release
+                - hotfix
+                - master
+                - /renovate.*/
+                - /custom-renovate.*/
+      - lint:
+          requires:
+            - install
+      - tsc:
+          requires:
+            - install
+      - test_mysql:
+          requires:
+            - install
+      - test_postgres:
+          requires:
+            - install
+      - test_mongodb:
+          filters:
+            branches:
+              ignore:
+                - develop
+                - release
+                - hotfix
+                - master
+                - /renovate.*/
+                - /custom-renovate.*/
+          requires:
+            - install
+  renovate_verify:
+    jobs:
+      - install_without_modules_cache:
+          filters:
+            branches:
+              only:
+                - /renovate.*/
+                - /custom-renovate.*/
+      - lint:
+          requires:
+            - install_without_modules_cache
+      - tsc:
+          requires:
+            - install_without_modules_cache
+      - test_mysql:
+          requires:
+            - install_without_modules_cache
+      - test_postgres:
+          requires:
+            - install_without_modules_cache
+      - test_mongodb:
+          requires:
+            - install_without_modules_cache
